@@ -1,0 +1,477 @@
+---
+title: "Stratégie d'Investissement basé sur le régime macroéconomique, la visualisation RRG et l'importance des facteurs fondamentaux"
+output: 
+  html_document:
+    theme: cosmo
+    version: 4 
+    toc: true
+    number_sections: true
+    toc_float: 
+      collapsed: false
+---
+
+# Objectif du projet
+
+L'objectif de ce projet est de développer une stratégie d'allocation dynamique à mi-chemin entre la gestion active et passive ("Smart Beta"), se basant sur le régime macroéconomique dans lequel les actions évoluent.
+Afin d'atteindre cette objectif on peut décomposer ce projet en plusieurs étapes distinctes :
+
+**1.** Différencier les environnement macroéconomique mensuellement en différentes catégories : Expansion, Inflation, Reprise ou Crise.
+
+**2.** Analyser les facteurs microéconomiques et utiliser le machine Learning afin de determiner les facteurs "gagnants" selon chaque régimes macroéconomiques.
+
+**3.** Construire un portefeuille et simuler une stratégie qui sélectionne uniquement les actions les plus sûres et performantes selon le régime détecté.
+
+# Configuration
+
+## Importation des librairies
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)    
+library(plotly)     
+library(kableExtra)
+library(DT)           
+library(randomForest)
+```
+
+## Nettoyage et Traitement des données
+
+Cette partie est nécessaire pour traiter et nettoyer la base de données spx_macro.RData fourni avant l'analyse.
+
+On réalise alors différentes actions sur celle-ci:
+
+**1.** On filtre les actions qui possèdent un historique complet sur toute la période allant de janvier 2000 à aout 2025.
+
+**2.** On calcul 2 nouveaux indicateurs microéconomiques : le Momentum 12 mois ainsi que la croissance des ventes sur 1 an.
+
+**3.** On calcul aussi 2 indicateurs globaux du marché : la volatilité moyenne ainsi que le rendement moyen afin de servir de comparaison à notre portefeuille final.
+
+**4.** On prépare et on lisse sur 3 mois les données macroéconomiques suivantes : le PIB ainsi que le chômage, car après avoir essayé de lisser les données sur 3 pour les 4 datas, seulement lisser le PIB et le chômage permet d'obtenir les meilleures statistiques descriptives.
+*(Le lissage des données est une solution donnée par Gemini pour réduire le bruit mensuel car il y avait sur la frise chronologique des barres de régimes bizarres, exemple : mois de crises entre 3 mois d'expansions des 2 côtés)* 
+
+**5.** On supprime les données manquantes (NA) pour ne garder que des données propres à l'emploi.
+
+```{r setup2, message=FALSE, warning=FALSE}
+load("spx_macro.RData") # Chargement de la base de données
+
+# On veut un dataset balancé pour faciliter le backtest
+comptage <- spx_macro |>
+  group_by(symbol) |>       # On regarde action par action
+  summarise(nb_mois=n()) |> # On compte combien de mois elle est présente
+  ungroup()
+
+max_obs <- max(comptage$nb_mois) # On trouve le nombre max de mois présent
+tickers_ok <- comptage |> # On récupère la liste des symboles qui ont le maximum d'observation
+  filter(nb_mois == max_obs) |> 
+  pull(symbol)
+
+df_actions <- spx_macro |>
+  filter(symbol %in% tickers_ok) |> # On ne garde que les actions qui ont le maximum d'observation
+  arrange(symbol, date) |>          # On les tri en fonction de leur symbole et de leur date
+  group_by(symbol) |>
+  mutate(mom_12m = (close / lag(close, 12)) - 1, # On créé ici une nouvel variable mom_12m qui est le momentum de l'action sur 12 mois
+    croissance_vente = (revenue / lag(revenue, 12)) - 1 ) |> # Et la variable croissance_vente qui est la croissance des ventes sur 1 an
+  ungroup() |>
+  drop_na(mom_12m, croissance_vente) |> # On supprime les lignes ou les valeurs n'ont pas pu être calculer (souvent au début)
+  filter(date >= "2000-01-01") # On garde seulement les données à partir du 1 janvier 2000
+
+vol_marche <- df_actions |>
+  group_by(date) |> # On regroupe les données par date
+  summarise(vix_proxy = mean(vol_1y, na.rm = TRUE), # On détermine ici la VIX du marché en prenant la moyenne des volatilités de toutes les actions
+    ret_marche = mean(return, na.rm = TRUE)) # On calcule ici le rendement moyen mensuel du marché en prenant la moyenne des retours de toutes les actions
+
+df_macro <- df_actions |> # On construit la table macro-économique finale et on réalise un lissage sur 3 mois(on réalise le lissage seulement pour le pib et le chomage car c'est la configuration dans laquelle on obtiens les statistiques descriptives optimales)
+  select(date, inflation, gdp_growth, unemployment, fed_rate) |> # On sélectionne les données macro
+  distinct(date, .keep_all = TRUE) |> # On ne garde qu'une ligne par mois (car les données macro sont les mêmes pour chaque action à la même date)
+  left_join(vol_marche, by = "date") |> # On ajoute les données macros calculés juste avant
+  arrange(date) |> # On tri les dates dans l'ordre chronologique
+  mutate(infl_lisse = inflation, # On applique le lissage ici
+    pib_lisse  = (gdp_growth + lag(gdp_growth, 1) + lag(gdp_growth, 2)) / 3,
+    vix_lisse  = vix_proxy,
+    chom_lisse = (unemployment + lag(unemployment, 1) + lag(unemployment, 2)) / 3) |>
+  drop_na() # On supprime les valeurs manquantes de la table : "NA"
+
+# On a finalement nos données "actions" prêtes et adaptés à la suite du programme
+actions_clean <- df_actions |>
+  select(date, symbol, sector, fwd_return, mkt_cap, d2e, croissance_vente, mom_12m, p2b, vol_1y, profit_margin)
+```
+
+# Analyse Macro-Economique
+
+## Calcul des Régimes
+
+On passe ici à la partie simulation; Notre objectif est ici de déterminer mois après mois quel est le régime économique du marché sans utiliser les données du futur et éviter ainsi un "Look-ahead bias". On réalise donc les étapes suivantes :
+
+**1.** On créé une fonction trouver_cluster qui s'occupe de déterminer le régime auquel le mois en cours est le plus proche. On définit par ailleurs un "buffer" de 3 ans qui permet de commencer la simulation à partir de 2003 *(On considère qu'avant on a pas assez de données pour pouvoir simuler correctement le régime)*.
+
+**2.** On définit la boucle qui va permettre de traiter les mois un par un en partant de janvier 2003 à aout 2025. On sépare alors les données mensuelles d'avant et du mois étudié pour entrainer et tester la simulation.
+
+**3.** On met à l'échelle les différentes données afin de les rendre comparables et ainsi pouvoir évaluer la gravité ou non des différents indicateurs macroéconomique étudié.
+
+**4.** Un algorithme Kmeans va ensuite déterminer les 4 clusters cherchés en se basant sur les 4 variables macro et va identifier leur profil moyen (centroïdes).
+
+**5.** Un fois les 4 profils types déterminé, on associe chacun d'entre eux à un régime en suivant les particularité suivantes : *"Crise" est le régime avec la volatilité la plus haute*, *"Inflation" est le régime avec l'inflation la plus haute parmi les profils restants*, *"Expansion" est le régime avec le PIB le plus élevé parmi les régimes restants*, *et finalement le dernier profil sera associé au régime "Reprise"*.
+
+**6.** C'est à la fin de la boucle que l'on utilise la fonction déterminer plus haute trouver_cluster, qui s'occupe alors d'associer le mois actuel (de la boucle) au régime qui lui ressemble le plus (datas plus proche du centroïde).
+
+**7.** On assemble finalement tout les mois analysés pour créér une frise chronologique que l'on pourra visualiser plus tard
+
+**8.** On complète les 3 années buffer en admettant que celles-ci étaient des années d'Expansion avant de combiner les données macroéconomique aux données microéconomique au sein d'une table (df_master).
+
+*Note: Je me suis dis une fois en allant en cours : "Il doit surement y avoir des secteurs plus performants à certains moment et selon certaines configuration macroéconomique". J'ai fait des recherches et c'est alors que je suis tombé sur le RRG que j'ai trouvé super interessant. J'ai décidé de baser mon projet sur celui-ci et j'ai pu définir 4 régimes "basique" que je pouvais identifier avec les données macroeconomique fournis. Je me suis néanmoins aidé de Gemini afin d'affiner cette stratégie et définir la meilleure méthode de ML à utiliser pour définir ces régimes. Il a aussi pu m'aider dans la réalisation du bloc suivant, du calcul pour la force relative du RRG et de l'ajout de la définition des facteurs fondamentaux.*
+
+```{r macro_kmeans}
+trouver_cluster <- function(ligne, centres) { # On définit ici la fonction trouver_cluster qui permettre plus tard de determiner de quelle cluster chaque mois se rapproche t il le plus
+  dists <- apply(centres, 1, function(c) sum((ligne - c)^2))
+  return(which.min(dists))}
+
+all_dates <- unique(unique(df_macro$date)) # On récupère la liste de toutes les années présentent dans df_macro (ce sera de 2000 à 2024)
+annee_debut <- min(year(all_dates)) + 3 # On met en place une periode de buffer de 3 ans 
+dates_simulation <- all_dates[year(all_dates) >= annee_debut] # On défini la date à partir de laquelle notre test va être réalisé
+liste_res <- list()                   
+
+for (i in seq_along(dates_simulation)) { # On réalise une boucle pour simuler les données mois par mois
+  d <- dates_simulation[i]
+  donnees_train <- df_macro |> 
+    filter(date < d) # On récupère toute les données avant le mois de la boucle, ce seront les données sur lesquelles la simulation sera réaliser
+  donnees_test  <- df_macro |> 
+    filter(date == d) # On récupère toute les données du mois de la boucle, ce seront les données sur lesquelles les résultats de la simulation seront tester 
+  vars_eco <- c("infl_lisse", "pib_lisse", "vix_lisse", "chom_lisse")
+  moyennes <- colMeans(donnees_train[vars_eco]) # On calcule la moyenne de chaque colonne
+  ecart_types <- apply(donnees_train[vars_eco], 2, sd) # On calcule l'écart-type de chaque colonne
+  train_s <- scale(donnees_train[vars_eco]) # On transforme toutes les données en Z-score
+  test_s  <- scale(donnees_test[vars_eco], center = moyennes, scale = ecart_types) # On transforme toutes les données en Z-score mais seulement en utilisant les moyennes et ecart types passées
+  set.seed(42) # On set la seed pour le ml non-supervisé
+  modele_km <- kmeans(train_s, centers = 4, nstart = 50) # On utilise la fonction kmeans pour relever la proximité mathématiques de certains mois selon l'inflation, le pib, la vix et le chomage
+  centres <- as.data.frame(modele_km$centers) # On récupère les coordonnées des centres des 4 variables définis par kmeans
+  centres$id_orig <- 1:4 # On associe alors un numéro (de 1 à 4) à chacun de ces centres
+
+  id_crise <- centres |> 
+    arrange(desc(vix_lisse)) |> 
+    slice(1) |> 
+    pull(id_orig) # On défini la crise comme étant le cluster avec la Volatilité max
+  id_infla <- centres |> 
+    filter(id_orig != id_crise) |> 
+    arrange(desc(infl_lisse)) |> 
+    slice(1) |> 
+    pull(id_orig) # On défini l'inflation comme étant le cluster avec l'inflation max parmi les cluster restants
+  id_exp <- centres |> 
+    filter(!id_orig %in% c(id_crise, id_infla)) |>
+    arrange(desc(pib_lisse)) |> 
+    slice(1) |> 
+    pull(id_orig) # On défini l'expension comme étant le cluster avec la croissance du gdp max parmi les cluster restants
+  id_repr <- setdiff(1:4, c(id_crise, id_infla, id_exp)) # On défini la reprise comme étant le cluster restant
+  # On assigne ici les nom suivants aux régimes définis juste au-dessus
+  map_regime <- c()
+  map_regime[id_crise] <- "Crise" 
+  map_regime[id_infla] <- "Inflation"
+  map_regime[id_repr]  <- "Reprise"
+  map_regime[id_exp]   <- "Expansion"
+
+  preds <- apply(test_s, 1, function(row) trouver_cluster(row, modele_km$centers)) # On test ici à savoir ici quelle mois se rapproche de quel régime en fonction de leur similarité de leur données avec les centroïdes des différents cluster
+  preds_eco <- map_regime[preds]
+
+  tmp <- donnees_test |> 
+    mutate(regime = as.factor(preds_eco)) # On leur associe ici le nom du régime selectionné
+  liste_res[[length(liste_res)+1]] <- tmp} # On archive le mois a son régime dans la liste des résultats
+
+df_regimes <- bind_rows(liste_res) # On créé un tableau avec tout les resultats obtenus precedemment
+debut <- df_macro |> # Ayant pris 3 années de buffer on admet que ces 3 années comportait uniquement des mois d'Expansion
+  filter(year(date) < annee_debut) |> 
+  mutate(regime = "Expansion") 
+
+df_regimes <- bind_rows(debut, df_regimes) |> # On ajoute ces 3 années au rsultats du ML
+  arrange(date) |>
+  mutate(ym = year(date) * 100 + month(date), # On créé une donnée numérique qui définira chaque mois (ex: 202003 = mars 2020)
+  regime = factor(regime, levels = c("Expansion", "Inflation", "Reprise", "Crise"))) # Cela permet de garantir que chaque graphique aura les régimes de sa légende dans cet ordre
+
+df_master <- actions_clean |>
+  mutate(ym = year(date) * 100 + month(date)) |> # On créé la même donnée numérique qu'au dessus
+  inner_join(df_regimes |> 
+  select(ym, regime), by = "ym") # On joint ici les résultats des régimes de la table df_regimes à chaque ligne ayant le même ym dans actions_clean pour crée une table général df_master
+```
+
+## Résumé Statistique
+
+Ce bloc sert à générer un tableau de synthèse statistique des différents régime économique identifié :
+
+**1.** On calcul la moyenne des quatre indicateurs macroéconomiques suivants pour chaque régimes : Inflation, Croissance du PIB, Volatilité VIX et Chômage.
+
+**2.** On traduit les identifiants numériques 1, 2, 3 et 4 en "Expansion", "Inflation", "Reprise" et "Crise" pour rendre le tableau lisible.
+
+**3.** On génère un tableau propre, avec des données arrondi à 3 décimales.
+
+```{r macro_stats}
+stat_regimes <- df_regimes |> 
+  group_by(regime) |>  # On regroupe les données en fonction des différents régimes définis plus tôt
+  summarise(Infl_Moy = mean(infl_lisse, na.rm = TRUE),    # On calcule la moyenne de l'inflation du régime
+    PIB_Moy = mean(pib_lisse, na.rm = TRUE),    # On calcule la croissance moyenne du régime
+    VIX_Moy = mean(vix_lisse, na.rm = TRUE),     # On calcule la volatilité moyenne du régime
+    Chomage = mean(chom_lisse, na.rm = TRUE))  # On calcule le taux de chômage moyen du régime
+
+kbl(stat_regimes, digits = 3, caption = "Statistiques Descriptives par Régime") |> # On créé un tableau descriptif du régimes avec une limite de 3 unité après la virgule
+  kable_styling(bootstrap_options = c("striped", "hover")) |> # On défini le style du tableau
+  column_spec(1, bold = TRUE) # On met la première colonne en gras
+```
+
+On obtient ici les statistiques des différents régimes identifié.
+L'Expansion possède bien le pib moyen le plus élevé à 1.060, et une valeur d'inflation et de chômage relativement faible.
+L'Inflation est bien le régime caractérisé par l'inflation la plus haute.
+La Reprise marque bien la convalesence du marché après une crise, c'est pour cela que le chômage reste élevé.
+Et la Crise est bien identifié comme régime ayant une croissance négative, une forte volatilité et le chômage le plus élevé.
+
+# Visualisation des régimes et analyse sectorielle
+
+## Frise chronologique 2000-2025
+
+Cette partie génère une frise chronologique permettant de visualiser l'évolution des différents régimes économiques entre 2000-2025.
+
+```{r frise_chrono}
+# On veut ici visualiser le régimes des différents mois au cours des 24 dernières années pour regarder si on peut relier la définition des régimes réaliser precdemment est en accords avec les tendances economiques réellement observé au cours de ces 24 dernières années
+g_heat <- ggplot(df_regimes, aes(x = date, y = 1, fill = regime)) + # On créé un graphique ou l'on définit le temps sur l'axe des absices et y=1 pour avoir un graphique en 1 dimension
+  geom_tile() + # On crée un rectangle pour chaque mois de l'année qui sera rempli par la couleur du régime
+  labs(title = "Chronologie des Régimes", x="", y="", fill="Régime") + # On définit le titre du graphique et aucun titre pour les axes
+  theme_minimal() + # On garde le theme classique
+  theme(axis.text.y=element_blank(), panel.grid=element_blank()) + # On enlève les éléments en trop, (un 1.0 qui s'affichait et le quadrillage)
+  scale_fill_brewer(palette = "Set1")
+ggplotly(g_heat)
+```
+
+En observant la frise chronologique on observe bien que le modèle a su reconnaitre la crise du covid debut 2020 ainsi que le début de la guerre en Ukraine courant 2022. Pour ce qui est de la crise des subprimes on remarque que la crise n'est identifier qu'à partir de la fin de 2009 surement à cause du "survivorship bias", en effet les entreprises ayant fait faillite ne sont analysés dans ce modèles.
+
+## Relative rotation graph (RRG)
+
+On créé ici un Relative Rotation Graph (RRG). Il s'agit d'un outil de visualisation financière créé par *Julius de Kempenaer (2004)* qui permet d'analyser la force et la dynamique d'actifs financiers. On applique ici cet outil aux outils aux différents secteurs économiques selon les différents régimes afin de trouver les secteurs les plus performants selon la tendance macroéconomique du marché. Ce code réalise donc les étapes suivantes:
+
+**1.** On joint les données boursières aux différents régimes définis et on calcule la capitalisation boursière totale de chaque secteur pour chaque mois
+
+**2.** On calcul les indicateurs nécessaire au RRG : le poids de chaque secteur, la force relative ainsi que son Momentum sur 12 mois.
+
+**3.** On définit la position moyenne de chaque secteur selon chaque régime (Expansion, Inflation, Crise, Reprise).
+
+**4.** On génère le relative rotation graph en 4 parties selon les 4 régimes définis
+
+```{r rrg, message=FALSE, warning=FALSE}
+df_rrg <- df_master |> # On utilise la master table directement
+  group_by(date, regime, sector) |> # On regroupe maintenant les données par date, secteurs et Régimes
+  summarise(cap_totale = sum(mkt_cap), .groups="drop") |> # On calcul la capitalisation totale de chaque secteur
+  group_by(date) |>  # On groupe les données maintenant par date
+  mutate(poids = cap_totale / sum(cap_totale)) |>  # Et on calcule la proportion de la capitalisation du secteur par rapport à celle du marché pour chaque mois
+  group_by(sector) |> # on regroupe les données par secteur
+  mutate(
+    rs = poids / mean(poids),   # Et on va maintenant calculer la force relative
+    mom = (rs / lag(rs, 12)) * 100) |>  # Ainsi que le momentum de la force relative sur 12 mois
+  group_by(regime, sector) |> # On regroupe maintenant les données par régimes et secteurs
+  summarise(
+    x = mean(rs, na.rm=T), # La valeur x du secteur sera la moyenne de ses forces relatives
+    y = mean(mom, na.rm=T), # La valeur y du secteur sera la moyenne de son momentum 12 mois
+    .groups="drop")
+
+g_rrg <- ggplot(df_rrg, aes(x=x, y=y, color=sector)) + # On créé un graphique selon les données définis plus hautes (df_rrg) avec comme colonne x la moyenne des forces relatives et y la moyenne de son momentum, et chaque secteur aura une couleur différente
+  geom_point(size=3) + # Les secteurs seront afficher par des points de taille 3
+  facet_wrap(~regime) + # On divise ici le graph en 4 partie selon les 4 régimes définits
+  labs(title="Rotation Sectorielle par Régime Économique", # On définit ici le titre du graphique, de l'axe des abscisses et des ordonnées
+       x="Force Relative (Position)", 
+       y="Momentum (Vitesse)") +
+  theme_minimal() +
+  theme(legend.position="") 
+ggplotly(g_rrg) # On affiche le graphique construit jusqu'alors
+```
+
+Le RRG nous permet ici de visualiser les secteurs les plus performants selon les différents régimes identifiés. On remarque alors que en régime de crise on remarque que le secteur de la santé surperforme, on voit bien que en période de crise la santé reste le secteur défensif vers lequel il faut se tourner.
+Dans le cas d'une reprise l'immobilier ainsi que la construction bondissent, cela peut s'expliquer par la baisse des taux souvent associée à la fin d'une crise ce qui relance les deux secteurs.
+Pour ce qui est de l'inflation, l'immobilier reste le secteur le plus performant surement pour sa propriété d'actif réel qui a tendance a s'indexer à l'inflation.
+Finalement, on observe qu'en période d'Expansion les secteurs de la santé et de la construction semble offrir les meilleurs gains.
+
+# Analyse des facteurs fondamentaux par machine learning
+
+Cette partie fait une nouvelle fois appel au machine Learning pour déterminer quels sont les meilleurs indicateurs fondamentaux pour prédire les rendements futurs de chaque régimes.
+
+**1.** On commence par créer une fonction calcul_importance qui isole les données de chaque régime, récupère les données fondamentales avant d'entrainer un modèle RandomForest pour prédire les rendements futur. On cherche alors à obtenir l'importance de chacune des données fondamentales sur la prédiction du rendement futur.
+
+**2.** On réalise une boucle afin d'appliquer cette fonction a chacun des régimes avant d'archiver tout les résultats dans une table (res_rf).
+
+**3.** A la fin on affiche un graphique divisé par régime, nous présentant l'importance de chaque facteur prédictif selon chaque régime.
+
+```{r ml_facteur_fond, message=FALSE, warning=FALSE}
+calcul_importance <- function(regime_id, donnees) { # On définit une fonction pour l'utiliser plus tard dans une boucle qui prend les données et les id des régimes pour réaliser le randomForest
+  sub_df <- donnees |> 
+    filter(regime == regime_id) |> # On garde seulement les données du régime analysé
+    select(fwd_return, mkt_cap, d2e, profit_margin, croissance_vente, mom_12m, p2b) |> # On selectionne les données à utiliser pour le ML
+    drop_na() |> # On supprime les valeurs manquantes (NA)
+    filter(is.finite(d2e)) # On garde seulement les valeurs finit (si dette = 0 et equity=0, d2e n'est pas finis et le code plante)
+  set.seed(42) # On fixe la graine aléatoire pour pourvoir reproduir les résultats
+  rf <- randomForest(fwd_return ~ ., data = sub_df, ntree = 30, importance=TRUE) # On réalise l'entrainement d'un randomForest pour mesurer l'importance de chaque variable ppur chaque régime
+  # On récupère la matrice d'importance (IncMSE : augmentation de l'erreur si on mélange la variable)
+  imp_df <- as.data.frame(importance(rf)) # On récupère la matrice d'importance
+  imp_df$Variable <- rownames(imp_df) # On transforme la matrice en tableau avec lignes et colonne
+  imp_df$Regime <- as.factor(regime_id) # Et on associe les résultats avec le régime analysé
+  return(imp_df)}
+
+noms_regimes <- c("Expansion", "Inflation", "Reprise", "Crise")
+liste_resultats <- list()
+
+for (i in noms_regimes) { # On fait une boucle pour parcourir les différents régimes
+  liste_resultats[[i]] <- calcul_importance(i, donnees=df_master)} # On inclu chaque résultats obtenu via la fonction calcul_importance dans la liste_resultats
+
+res_rf <- bind_rows(liste_resultats) # On rassemble les 4 tableaux de données obtenus dans res_rf
+  res_rf <- res_rf
+  g_ml <- ggplot(res_rf, aes(x=reorder(Variable, `%IncMSE`), y=`%IncMSE`, fill=Regime)) + # On initialise le graphique
+    geom_col() + 
+    coord_flip() + # On pivote les axes pour avoir des barres horizontales
+    facet_wrap(~Regime) +
+    theme_minimal() +
+    scale_fill_brewer(palette = "Set2") + # Palette de couleurs distinctes
+    labs(title="Importance des Facteurs Fondamentaux (Random Forest)", 
+         subtitle="Quelle caractéristique explique le mieux le rendement futur dans chaque régime ?",
+         x="",
+         y="% Gain Précision (Importance)")
+  ggplotly(g_ml)
+```
+
+# Mis en place et Backtesting de la stratégie
+
+## Définition de la stratégie d'achat
+
+Cette partie consiste à réaliser le code de la stratégie d'achat en nous aidant des résultats obtenus précédemment. On y réalise alors :
+
+**1.** La préparation des données, en supprimant les lignes incomplètes et en décalant les régimes de 1 mois. *(Pour investir en février on utilise les données du régime de janvier).
+
+**2.** On identifie les 4 secteur ayant le meilleur momentum moyen selon le régime en cours puis on réalise la sélection des 30 meilleures actions de ces secteurs en nous basant sur le critère fondamental identifié plus tôt.
+
+* **Crise** : Momentum
+
+* **Inflation** : Momentum
+
+* **Reprise** : Marge nette
+
+* **Expansion** : Capitalisation
+
+**3.** On réalise finalement une pondération en calculant un poids ajusté du risque, on divise le score de l'action par sa volatilité afin de privilégier les actions stables
+
+```{r backtest, message=FALSE, warning=FALSE}
+bt_data <- df_master |> 
+  mutate(regime_trading = lag(regime)) |> 
+  select(date, symbol, sector, fwd_return, regime_trading, d2e, croissance_vente, mom_12m, profit_margin, vol_1y, mkt_cap) |>
+  drop_na()
+
+choix_actions_risk_adj <- function(df) { # On défini une fonction de sélection des actions pour notre portefeuille en fonction des n premières actions selon les resultats obtenus plus-haut
+  
+  r <- df$regime_trading[1]
+  
+  if(r == "Crise") {
+    secteurs_cibles <- c("Health Care and Social Assistance", 
+                         "Administrative and Support and Waste Management and Remediation Services", 
+                         "Utilities", 
+                         "Accommodation and Food Services")
+    critere <- "mom_12m"
+  } else if(r == "Inflation") {
+    secteurs_cibles <- c("Administrative and Support and Waste Management and Remediation Services", 
+                         "Real Estate Rental and Leasing", 
+                         "Health Care and Social Assistance", 
+                         "Construction")
+    critere <- "mom_12m"
+  } else if(r == "Reprise") {
+    secteurs_cibles <- c("Mining", 
+                         "Real Estate Rental and Leasing", 
+                         "Administrative and Support and Waste Management and Remediation Services", 
+                         "Accommodation and Food Services")
+    critere <- "profit_margin"
+  } else { 
+    secteurs_cibles <- c("Professional, Scientific, and Technical Services", 
+                         "Retail Trade", 
+                         "Health Care and Social Assistance", 
+                         "Finance and Insurance")
+    critere <- "mkt_cap"}
+
+  
+  df_filtre <- df |> 
+    filter(sector %in% secteurs_cibles) # On ne filtre les actions que parmi ces 4 secteurs
+  
+  picks <- df_filtre |> # On prend le tableau de données du mois
+    arrange(desc(get(critere))) |> # On tri les données en fonction de leur facteur fondamentale comme observé sur le graphique des Facteurs fondamentaux sortie plus haut
+    slice(1:30) |> # On ne garde que les 30 premières actions
+    mutate(raw_score = get(critere))
+  
+  picks <- picks |> # On prend toute les actions selectionner selon les régimes
+    mutate(clean_score = pmax(raw_score, 0.0001), # Il est possible d'obtenir des données négatives, pour ne pas donner de poids négatif plus tard on modifie cette valeur pour être sur de lui mettre la moins grosse allocation possible
+      risk_adj_score = clean_score / (vol_1y), # En suivant la stratégie du score ajusté, on créé une nouvelle colonne entre la valeur de l'action divisé par sa volatilité, ainsi on réduit le risque d'allouer des fonds à une action trop volatile
+      poids = risk_adj_score / sum(risk_adj_score)) # Finalement on divise le score de chaque action par le score total de toute les actions pour avoir un % d'allocation pour chacune d'elle
+  return(picks)}
+```
+
+## Backtesting
+
+La section suivante réalise le backtest de la stratégie mise en place tout au long du projet. On simule ici la vie du portefeuille mois par mois sur toute la période 2000-2025 pour vérifier la rentabilité de la stratégie.
+
+**1.** On commence donc par créer une boucle qui permettra d'isoler les données boursière mensuelles et d'y appliquer la fonction de stock picking défini (choix_actions_risk_adj).
+
+**2.** Cette boucle d'occupe de calculer non seulement le rendement du portefeuille mais aussi celle du marché.
+
+**3.** A la suite de la boucle on transforme alors tout les rendements mensuels en courbe qui permettront de visualiser et de comparer qui de la stratégie ou du marché aurait obtenu les meilleurs résultats pour 100€ investi.
+
+```{r backtest2, message=FALSE, warning=FALSE}
+dates_bt <- unique(sort(bt_data$date)) # On récupère tout les mois et on les mets dans l'ordre chronologique
+res_bt <- list()    # On créé une liste res_bt qui nous servira à mettre les données de performance du portefeuille
+
+for(i in 1:(length(dates_bt)-1)) { # On créé une boucle mensuelle
+  d <- dates_bt[i] # On prend le mois de la boucle
+  df_mois <- bt_data |> 
+    filter(date == d) # On garde seulement les données du mois en question
+  pf <- choix_actions_risk_adj(df_mois) # On utilise la fonction de définition de notre protefeuille définis plus tôt
+  ret_brut <- sum(pf$fwd_return * pf$poids) # On calcul le retour du portefeuille en fonction du retour de chaque action et de son poids
+  ret_benc <- mean(df_mois$fwd_return, na.rm = TRUE) # On récupère le retour du benchmark pour comparaison
+  res_bt[[i]] <- data.frame(date = d, # On stock le mois, le retour du portefeuille et du benchmark dans la list créé plus tôt
+    ret_strat = ret_brut, # On enregistre les gains de la stratégie pour le mois entrain d'être bouclé
+    ret_bench = ret_benc)} # On enregistre les gains du marché pour le mois entrain d'être bouclé
+
+df_perf <- bind_rows(res_bt) |> # On assemble tout les résultats obtenus dans la boucle et placé dans res_bet au sein d'un nouveaux grand tableau
+  mutate(valo_strat = 100 * cumprod(1 + ret_strat), # On calcule ici l'évolution de la valeur du portefeuille en prenant en compte le produit cumulatif
+    valo_bench = 100 * cumprod(1 + ret_bench)) # On calcule ici l'évolution de la valeur du marché en prenant en compte le produit cumulatif
+
+g_perf <- ggplot(df_perf, aes(x = date)) +
+  geom_line(aes(y = valo_strat, color = "Stratégie (Signal/Vol)")) +
+  geom_line(aes(y = valo_bench, color = "Benchmark")) +
+  scale_y_log10() + # On met le graphique à l'échelle logarithmique
+  labs(title = "Performance Historique vs Benchmark", y = "Valeur (Log Scale)") +
+  theme_minimal()
+ggplotly(g_perf) # On affiche le graphique
+```
+
+## Résultats statistiques du Backtesting
+
+On termine ce programme avec un tableau de statistique qui permet d'observer et de valider ou non la performance du modèle via des métriques financières communes :
+
+**1.** On commence par créer 4 fonctions qui permettront de calculer respectivement, le ratio de sharpe, la volatilité annualisé, le rendement moyen ainsi que le drawdown maximum.
+
+**2.** On créer ensuite le tableau comparatif dans lequel on applique les fonctions aux résultats de la stratégie mise en place et du marché.
+
+```{r backtest3, message=FALSE, warning=FALSE}
+calc_sharpe <- function(r) {mean(r) / sd(r) * sqrt(12) } # On défini ici la fonction qui calcule le ratio de sharpe
+calc_vol    <- function(r) {sd(r) * sqrt(12) * 100 }     # On défini ici la fonction qui calcule la volatilité annualisé
+calc_ret    <- function(r) {mean(r) * 12 * 100 }         # Celle pour le rendement moyen annualisé
+calc_mdd <- function(vals) {sommet <- cummax(vals) # Et finalement pour la plus grosse perte sur la période étudié
+  dd <- (vals - sommet) / sommet
+  return(min(dd) * 100)}
+
+tab_perf <- data.frame(
+  Metrique = c("Rendement Annuel", "Volatilité", "Ratio de Sharpe", "Max Drawdown", "Capital Final"),
+  Strategie = c(
+    sprintf("%.2f %%", calc_ret(df_perf$ret_strat)), # A partir d'ici on utilise les fonctions définis plus hautes pour calculer et afficher les résultats du benchmark ainsi que du portefeuille réalisé
+    sprintf("%.2f %%", calc_vol(df_perf$ret_strat)),
+    sprintf("%.2f",    calc_sharpe(df_perf$ret_strat)),
+    sprintf("%.2f %%", calc_mdd(df_perf$valo_strat)),
+    format(round(tail(df_perf$valo_strat, 1), 0), big.mark=" ")),
+  Benchmark = c(
+    sprintf("%.2f %%", calc_ret(df_perf$ret_bench)),
+    sprintf("%.2f %%", calc_vol(df_perf$ret_bench)),
+    sprintf("%.2f",    calc_sharpe(df_perf$ret_bench)),
+    sprintf("%.2f %%", calc_mdd(df_perf$valo_bench)),
+    format(round(tail(df_perf$valo_bench, 1), 0), big.mark=" ")))
+
+kbl(tab_perf, caption = "Analyse Comparative de Performance") |> 
+  kable_styling(full_width = F, bootstrap_options = c("striped", "hover")) |> 
+  column_spec(2, bold = TRUE, color = "white", background = "blue")
+```
+Le tableau de comparaison des statistiques démontre que le modèle mis en place obtient des résultats bien en dessous du Benchmark catégorisé par le rendement équipondéré moyen du marché.
+Il est possible que les résultats soit inexacts et mis à défaut à cause du Survivorship bias.
