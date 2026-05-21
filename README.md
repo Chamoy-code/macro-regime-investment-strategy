@@ -12,9 +12,9 @@ This project develops a dynamic "Smart Beta" asset allocation strategy positione
 
 The strategy is structured in three main stages:
 
-1. **Macro regime detection** — classify each month as Expansion, Inflation, Recovery, or Crisis using unsupervised K-means clustering on macroeconomic indicators.
-2. **Sector rotation analysis** — use a Relative Rotation Graph (RRG) to identify which sectors outperform in each regime.
-3. **Factor importance ranking** — use a Random Forest model to determine which fundamental factors best predict future returns in each regime, then backtest the resulting portfolio strategy.
+1. **Macro regime detection**, classify each month as Expansion, Inflation, Recovery, or Crisis using unsupervised K-means clustering on macroeconomic indicators.
+2. **Sector rotation analysis**, use a Relative Rotation Graph (RRG) to identify which sectors outperform in each regime.
+3. **Factor importance ranking**, use a Random Forest model to determine which fundamental factors best predict future returns in each regime, then backtest the resulting portfolio strategy.
 
 ---
 
@@ -56,7 +56,7 @@ Inspired by Julius de Kempenaer's RRG framework (2004). For each sector and regi
 - Computes 12-month momentum of that Relative Strength.
 - Plots the average position of each sector per regime to identify leading sectors.
 
-### 4. Factor Importance — Random Forest
+### 4. Factor Importance - Random Forest
 
 A Random Forest regressor (`fwd_return ~ fundamentals`) is trained separately for each regime to measure `%IncMSE` — how much prediction error increases when each variable is permuted. This identifies the most predictive fundamental factor per regime.
 
