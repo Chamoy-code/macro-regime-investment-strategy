@@ -2,7 +2,7 @@
 
 > Academic project completed at **EMLYON Business School** as part of the R programming curriculum.
 
-**Period covered:** January 2000 – August 2025
+**Period covered:** January 2000, August 2025
 
 ---
 
